@@ -7,12 +7,10 @@ const app = express();
 const server = http.createServer(app);
 
 // --- НАСТРОЙКА CORS ДЛЯ РАБОТЫ В ИНТЕРНЕТЕ ---
-// Теперь мы разрешаем подключения с любого адреса, 
-// так как наш клиент будет на другом домене (Netlify).
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST", "PATCH", "DELETE"]
   }
 });
 
@@ -59,7 +57,7 @@ app.post('/api/orders', (req, res) => {
     
     orders = [...activeOrders, ...completedOrders];
 
-    io.emit('update_orders', orders); // Оповещаем всех клиентов
+    io.emit('update_orders');
     res.status(201).json(newOrder);
 });
 
@@ -73,11 +71,10 @@ app.patch('/api/orders/:id', (req, res) => {
     const { song_title, artist_name, note } = req.body;
     orders[orderIndex] = { ...orders[orderIndex], song_title, artist_name, note };
     
-    // Создаем уведомление
     const notification = { id: Date.now(), type: 'edited', payload: orders[orderIndex], timestamp: new Date().toISOString() };
     notifications.unshift(notification);
     
-    io.emit('update_orders', orders);
+    io.emit('update_orders');
     io.emit('new_notification', notification);
     res.json(orders[orderIndex]);
 });
@@ -90,7 +87,7 @@ app.patch('/api/orders/:id/status', (req, res) => {
         return res.status(404).json({ message: 'Заказ не найден.' });
     }
     orders[orderIndex].status = req.body.status;
-    io.emit('update_orders', orders);
+    io.emit('update_orders');
     res.json(orders[orderIndex]);
 });
 
@@ -108,7 +105,21 @@ app.delete('/api/orders/:id', (req, res) => {
     
     orders = orders.filter(o => o.id !== orderId);
     
-    io.emit('update_orders', orders);
+    io.emit('update_orders');
+    res.status(204).send();
+});
+
+// НОВЫЙ ЭНДПОИНТ: Очистить все заказы для стола
+app.delete('/api/orders/table/:tableId', (req, res) => {
+    const tableIdToClear = req.params.tableId;
+    
+    const initialOrderCount = orders.length;
+    orders = orders.filter(order => String(order.table_id) !== tableIdToClear);
+    
+    if (orders.length < initialOrderCount) {
+      io.emit('update_orders'); 
+    }
+    
     res.status(204).send();
 });
 
@@ -122,7 +133,7 @@ app.post('/api/orders/reorder', (req, res) => {
     
     if (reordered.length === activeOrders.length) {
         orders = [...reordered, ...completed];
-        io.emit('update_orders', orders);
+        io.emit('update_orders');
         res.json({ message: 'Очередь обновлена.' });
     } else {
         res.status(400).json({ message: 'Ошибка при пересортировке.' });
@@ -149,11 +160,9 @@ io.on('connection', (socket) => {
   });
 });
 
-// Динамический порт для хостинга, с фолбэком на 3000 для локальной работы
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
   console.log(`Сервер КАРАОКЕ МОСКВА запущен и слушает порт ${PORT}`);
-  console.log(`Адрес для API: http://localhost:${PORT}`);
 });
 
