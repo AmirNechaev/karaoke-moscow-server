@@ -109,14 +109,16 @@ app.delete('/api/orders/:id', (req, res) => {
     res.status(204).send();
 });
 
-// НОВЫЙ ЭНДПОИНТ: Очистить все заказы для стола
+// Очистить все заказы для стола
 app.delete('/api/orders/table/:tableId', (req, res) => {
     const tableIdToClear = req.params.tableId;
+    console.log(`Получен запрос на очистку стола №${tableIdToClear}`);
     
     const initialOrderCount = orders.length;
     orders = orders.filter(order => String(order.table_id) !== tableIdToClear);
     
     if (orders.length < initialOrderCount) {
+      console.log(`Заказы для стола №${tableIdToClear} очищены. Отправка обновления клиентам.`);
       io.emit('update_orders'); 
     }
     
