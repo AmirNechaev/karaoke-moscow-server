@@ -1,8 +1,9 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
+const mongoose = require('mongoose');
 const cors = require('cors');
-const fs = require('fs'); // Добавляем модуль для работы с файлами
+require('dotenv').config(); // Для локальной разработки
 
 const app = express();
 const server = http.createServer(app);
@@ -17,37 +18,29 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// --- ХРАНИЛИЩЕ ДАННЫХ ---
-const HISTORY_FILE_PATH = './history.json';
+// --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ MONGODB ---
+mongoose.connect(process.env.DATABASE_URL)
+  .then(() => console.log('Успешное подключение к MongoDB Atlas'))
+  .catch(err => console.error('Ошибка подключения к MongoDB:', err));
+
+// --- МОДЕЛЬ ДАННЫХ ДЛЯ ИСТОРИИ ---
+const historySchema = new mongoose.Schema({
+    id: Number,
+    song_title: String,
+    artist_name: String,
+    table_id: String,
+    status: String,
+    type: String,
+    note: String,
+    dj_note: String,
+    created_at: Date
+});
+
+const History = mongoose.model('History', historySchema);
+
+// --- ХРАНИЛИЩЕ ДАННЫХ В ПАМЯТИ (для текущей сессии) ---
 let orders = [];
 let notifications = [];
-let songHistory = [];
-
-// --- ФУНКЦИИ ДЛЯ РАБОТЫ С ИСТОРИЕЙ В ФАЙЛЕ ---
-function loadHistory() {
-    try {
-        if (fs.existsSync(HISTORY_FILE_PATH)) {
-            const data = fs.readFileSync(HISTORY_FILE_PATH, 'utf8');
-            songHistory = JSON.parse(data);
-            console.log('Общая история песен успешно загружена из файла.');
-        } else {
-            console.log('Файл общей истории не найден, будет создан новый.');
-        }
-    } catch (err) {
-        console.error('Ошибка при загрузке общей истории песен:', err);
-    }
-}
-
-function saveHistory() {
-    try {
-        fs.writeFileSync(HISTORY_FILE_PATH, JSON.stringify(songHistory, null, 2), 'utf8');
-    } catch (err) {
-        console.error('Ошибка при сохранении общей истории песен:', err);
-    }
-}
-
-// Загружаем историю при старте сервера
-loadHistory();
 
 // --- API ЭНДПОИНТЫ ---
 
@@ -63,16 +56,14 @@ app.post('/api/orders', (req, res) => {
     const newOrder = {
         id: Date.now(), song_title, artist_name: artist_name || 'Не указан', table_id,
         status: 'new', type: isVip ? 'vip' : 'regular', note: note || '',
-        created_at: new Date().toISOString()
+        dj_note: '', created_at: new Date().toISOString()
     };
     const activeOrders = orders.filter(o => o.status !== 'completed');
     const completedOrders = orders.filter(o => o.status === 'completed');
     if (newOrder.type === 'vip') {
         const lastInProgressIndex = activeOrders.findLastIndex(o => o.status === 'in_progress');
         activeOrders.splice(lastInProgressIndex + 1, 0, newOrder);
-    } else {
-        activeOrders.push(newOrder);
-    }
+    } else { activeOrders.push(newOrder); }
     orders = [...activeOrders, ...completedOrders];
     io.emit('update_orders');
     res.status(201).json(newOrder);
@@ -94,16 +85,29 @@ app.patch('/api/orders/:id', (req, res) => {
     res.json(orders[orderIndex]);
 });
 
-app.patch('/api/orders/:id/status', (req, res) => {
+app.patch('/api/orders/:id/dj-note', (req, res) => {
+    const orderId = parseInt(req.params.id);
+    const orderIndex = orders.findIndex(o => o.id === orderId);
+    if (orderIndex === -1) { return res.status(404).json({ message: 'Заказ не найден.' }); }
+    orders[orderIndex].dj_note = req.body.dj_note || '';
+    io.emit('update_orders');
+    res.json(orders[orderIndex]);
+});
+
+app.patch('/api/orders/:id/status', async (req, res) => {
     const orderId = parseInt(req.params.id);
     const orderIndex = orders.findIndex(o => o.id === orderId);
     if (orderIndex === -1) { return res.status(404).json({ message: 'Заказ не найден.' }); }
 
-    // Если песня завершена, добавляем ее в общую историю
-    if (req.body.status === 'completed') {
+    if (req.body.status === 'completed' && orders[orderIndex].status !== 'completed') {
         const completedOrder = { ...orders[orderIndex], status: 'completed' };
-        songHistory.unshift(completedOrder); // Добавляем в начало
-        saveHistory(); // Сохраняем в файл
+        try {
+            const historyEntry = new History(completedOrder);
+            await historyEntry.save();
+            console.log('Заказ сохранен в общую историю');
+        } catch (err) {
+            console.error('Ошибка сохранения в общую историю:', err);
+        }
     }
     
     orders[orderIndex].status = req.body.status;
@@ -128,33 +132,18 @@ app.delete('/api/orders/:id', (req, res) => {
 app.delete('/api/orders/table/:tableId', (req, res) => {
     const tableIdToClear = req.params.tableId;
     const initialOrderCount = orders.length;
-    
-    // ИСПРАВЛЕНО: Используем нестрогое сравнение (!=), чтобы корректно
-    // обрабатывать случаи, когда table_id может быть числом или строкой.
     orders = orders.filter(order => order.table_id != tableIdToClear);
-    
-    if (orders.length < initialOrderCount) { 
-        io.emit('update_orders'); 
-    }
+    if (orders.length < initialOrderCount) { io.emit('update_orders'); }
     res.status(204).send();
 });
 
 app.delete('/api/orders/all', (req, res) => {
-    console.log('Получен запрос на полную очистку системы.');
     orders = [];
     notifications = [];
     io.emit('update_orders');
     io.emit('update_notifications');
     res.status(204).send();
 });
-
-app.delete('/api/history/all', (req, res) => {
-    console.log('Получен запрос на очистку общей истории.');
-    songHistory = [];
-    saveHistory();
-    res.status(204).send();
-});
-
 
 app.post('/api/orders/reorder', (req, res) => {
     const { orderedIds } = req.body;
@@ -173,8 +162,13 @@ app.post('/api/orders/reorder', (req, res) => {
 app.get('/api/notifications', (req, res) => { res.json(notifications); });
 app.delete('/api/notifications', (req, res) => { notifications = []; io.emit('update_notifications'); res.status(204).send(); });
 
-app.get('/api/history', (req, res) => {
-    res.json(songHistory);
+app.get('/api/history', async (req, res) => {
+    try {
+        const history = await History.find().sort({ created_at: -1 });
+        res.json(history);
+    } catch (err) {
+        res.status(500).json({ message: 'Не удалось загрузить общую историю' });
+    }
 });
 
 io.on('connection', (socket) => {
