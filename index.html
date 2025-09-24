@@ -1,576 +1,253 @@
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Karaoke Order System - Online</title>
-    <!-- Подключение Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Подключение библиотеки для иконок -->
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <!-- Подключение Socket.IO клиента -->
-    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-    <!-- Шрифты -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@700&display=swap" rel="stylesheet">
-    <style>
-        body {
-            font-family: 'Inter', sans-serif;
-            background-image: url('https://png.pngtree.com/background/20231101/original/pngtree-3d-illustration-of-a-neon-lit-brick-wall-picture-image_5829071.jpg');
-            background-size: cover;
-            background-position: center center;
-            background-attachment: fixed;
-        }
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: 
-                radial-gradient(ellipse at 50% 0%, rgba(0, 150, 255, 0.3) 0%, rgba(0, 150, 255, 0) 50%),
-                radial-gradient(ellipse at 50% 100%, rgba(225, 0, 125, 0.3) 0%, rgba(225, 0, 125, 0) 50%),
-                linear-gradient(to bottom, rgba(0,0,0,0.1), rgba(0,0,0,0.7));
-            pointer-events: none;
-        }
-        .fade-in { animation: fadeIn 0.5s ease-in-out; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
-        
-        .order-item.new-item { animation: slideIn 0.5s ease-out; }
-        @keyframes slideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
-        
-        .neon-text {
-            font-family: 'Orbitron', sans-serif;
-            color: #fff;
-            animation: flicker 1s infinite ease-in-out;
-        }
-        @keyframes flicker {
-            0%, 100% { opacity: 1; text-shadow: 0 0 5px #fff, 0 0 8px #fff, 0 0 15px #fff, 0 0 30px #f0f, 0 0 50px #f0f, 0 0 70px #f0f; }
-            50% { opacity: 0.7; text-shadow: 0 0 5px #fff, 0 0 8px #fff, 0 0 12px #fff, 0 0 20px #f0f, 0 0 35px #f0f, 0 0 45px #f0f; }
-        }
-        
-        .order-item { cursor: grab; }
-        .order-item:active { cursor: grabbing; }
-        .dragging { opacity: 0.5; background: rgba(139, 92, 246, 0.3); }
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require("socket.io");
+const cors = require('cors');
+const db = require('./db');
 
-        .highlight-update { animation: highlight 1.5s ease-out; }
-        @keyframes highlight {
-            0% { background-color: rgba(22, 163, 74, 0.3); }
-            100% { background-color: transparent; }
-        }
-        
-        .toast-notification {
-            animation: toastIn 0.5s ease, toastOut 0.5s ease 4.5s;
-        }
-        @keyframes toastIn { from { transform: translateY(-100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-        @keyframes toastOut { from { transform: translateY(0); opacity: 1; } to { transform: translateY(-100%); opacity: 0; } }
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*", // В целях безопасности здесь лучше указать домен вашего клиента
+    methods: ["GET", "POST", "PATCH", "DELETE"]
+  }
+});
 
-        .loader {
-            border: 5px solid #4a4a4a;
-            border-top: 5px solid #c084fc; /* purple-400 */
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            animation: spin 1s linear infinite;
-        }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-    </style>
-</head>
-<body class="text-white antialiased">
+app.use(cors());
+app.use(express.json());
 
-    <!-- Индикатор загрузки -->
-    <div id="loading-overlay" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-[9999]">
-        <div class="loader"></div>
-    </div>
+// Простое хранилище уведомлений в памяти. Для продакшена можно заменить на Redis или таблицу в БД.
+let notifications = [];
 
-    <div id="app" class="container mx-auto p-4 md:p-6 lg:p-8 relative z-10">
+// Функция для отправки обновлений всем клиентам
+const broadcastUpdate = () => {
+  io.emit('update_orders');
+  console.log('Разослано событие: update_orders');
+};
 
-        <!-- ОБЩАЯ ПАНЕЛЬ ОШИБКИ ПОДКЛЮЧЕНИЯ -->
-        <div id="connection-error-panel" class="hidden bg-red-900/80 backdrop-blur-sm border border-red-500 text-white p-6 rounded-2xl shadow-lg mb-6 fade-in">
-            <div class="flex items-center gap-4">
-                <i data-lucide="alert-triangle" class="w-10 h-10 text-red-400 flex-shrink-0"></i>
-                <div>
-                    <h3 class="font-bold text-lg">Ошибка подключения к серверу</h3>
-                    <p class="text-sm text-red-200 mt-1">Не удалось получить данные. Пожалуйста, убедитесь, что сервер по адресу <code id="error-ip-address" class="bg-red-500/30 px-1 rounded"></code> запущен и доступен.</p>
-                </div>
-            </div>
-        </div>
-
-
-        <!-- 1. Начальный экран / Выбор роли -->
-        <div id="home-view" class="hidden text-center fade-in">
-            <h1 class="text-4xl md:text-5xl font-bold mb-4 neon-text">КАРАОКЕ МОСКВА</h1>
-            <p class="text-gray-300 mb-8">Онлайн-система заказов</p>
-            <div id="tables-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 gap-3 md:gap-4 max-w-4xl mx-auto">
-                <!-- Кнопки столов будут сгенерированы здесь -->
-            </div>
-        </div>
-
-        <!-- 2. Интерфейс Гостя -->
-        <div id="guest-view" class="hidden max-w-lg mx-auto fade-in">
-            <div class="bg-black/50 backdrop-blur-md p-6 md:p-8 rounded-2xl shadow-lg border border-white/10">
-                <div class="text-center mb-6">
-                    <h1 class="text-2xl md:text-3xl font-bold text-white">Заказ песни</h1>
-                    <p id="table-info" class="text-purple-400 font-semibold mt-1"></p>
-                </div>
-                <form id="order-form">
-                    <div class="mb-4">
-                        <label for="song_title" class="block text-sm font-medium text-gray-300 mb-2">Название песни *</label>
-                        <input type="text" id="song_title" name="song_title" required maxlength="100" class="w-full bg-gray-900/50 border border-white/20 text-white rounded-lg p-3 focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition placeholder:text-gray-500" placeholder="Например, 'Батарейка'">
-                    </div>
-                    <div class="mb-4">
-                        <label for="artist_name" class="block text-sm font-medium text-gray-300 mb-2">Исполнитель</label>
-                        <input type="text" id="artist_name" name="artist_name" maxlength="100" class="w-full bg-gray-900/50 border border-white/20 text-white rounded-lg p-3 focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition placeholder:text-gray-500" placeholder="Жуки">
-                    </div>
-                     <div class="mb-6">
-                        <label for="order_note" class="block text-sm font-medium text-gray-300 mb-2">Примечание</label>
-                        <textarea id="order_note" name="order_note" rows="2" class="w-full bg-gray-900/50 border border-white/20 text-white rounded-lg p-3 focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition placeholder:text-gray-500" placeholder="Например, 'Посвящается Маше!'"></textarea>
-                    </div>
-                    <div class="mb-6">
-                         <label for="vip-order-toggle" class="flex items-center justify-center p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 cursor-pointer hover:bg-yellow-500/20 transition">
-                            <input type="checkbox" id="vip-order-toggle" class="h-4 w-4 rounded text-yellow-400 bg-transparent border-yellow-500 focus:ring-yellow-500">
-                            <span class="ml-3 text-yellow-300 font-semibold">★ Вне очереди (VIP)</span>
-                        </label>
-                    </div>
-                    <button type="submit" title="Заказать песню" class="w-20 h-20 mx-auto bg-white/10 backdrop-blur-sm border-2 border-white/20 hover:bg-white/20 hover:border-white/40 text-white font-bold rounded-full flex items-center justify-center transition-all transform hover:scale-110 shadow-2xl">
-                        <i data-lucide="mic" class="w-10 h-10"></i>
-                    </button>
-                </form>
-                
-                <div id="guest-message" class="my-4 text-center"></div>
-
-                <div class="mt-8 border-t border-white/10 pt-6">
-                    <div class="text-center text-sm text-gray-400">
-                         <p><span class="font-semibold text-gray-300">Стоимость заказа:</span> 50 000 vnd</p>
-                         <p class="mt-1"><span class="font-semibold text-yellow-300">VIP-заказ:</span> 500 000 vnd</p>
-                    </div>
-                    
-                    <div id="guest-history-section" class="mt-8">
-                        <h2 class="text-xl font-bold mb-4 text-center text-white">Ваши заказы</h2>
-                        <div id="guest-history-list" class="space-y-3 max-h-48 overflow-y-auto pr-2"></div>
-                        <div id="empty-guest-history-state" class="hidden text-center py-10 px-6 text-gray-400"><p>Вы еще не заказывали песни.</p></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 3. Интерфейс Звукооператора (DJ-пульт) -->
-        <div id="dj-view" class="hidden fade-in">
-             <div id="dj-toast-container" class="fixed top-4 right-4 md:top-5 md:right-5 z-50 w-auto max-w-[calc(100%-2rem)]"></div>
-            <div class="flex flex-wrap justify-between items-center mb-6 gap-y-4">
-                <div>
-                    <h1 class="text-2xl md:text-3xl font-bold">Очередь заказов</h1>
-                    <div class="flex items-center gap-x-4">
-                        <button id="toggle-history-btn" class="text-sm text-purple-400 hover:text-purple-300 transition">История за вечер</button>
-                        <button id="toggle-general-history-btn" class="text-sm text-cyan-400 hover:text-cyan-300 transition">Общая история</button>
-                    </div>
-                </div>
-                <div class="flex items-center gap-4">
-                    <div class="relative">
-                        <button id="notification-btn" class="relative text-gray-300 hover:text-white transition">
-                            <i data-lucide="bell"></i>
-                            <span id="notification-badge" class="hidden absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-black"></span>
-                        </button>
-                    </div>
-                    <div id="live-indicator" class="flex items-center gap-2 text-sm text-green-400">
-                        <span id="connection-status-dot" class="relative flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span></span>
-                        <span id="connection-status-text">Online</span>
-                    </div>
-                </div>
-            </div>
-
-            <div id="notification-panel" class="hidden absolute top-20 right-0 w-full max-w-sm bg-black/70 backdrop-blur-md border border-white/20 rounded-2xl shadow-lg z-40">
-                <div class="p-4 border-b border-white/10 flex justify-between items-center">
-                    <h3 class="font-bold text-lg">Уведомления</h3>
-                    <button id="clear-notifications-btn" class="text-xs text-purple-400 hover:text-purple-300">Очистить</button>
-                </div>
-                <div id="notification-list" class="p-2 max-h-96 overflow-y-auto"></div>
-                <div id="empty-notification-state" class="hidden p-10 text-center text-gray-400">Нет новых уведомлений.</div>
-            </div>
-
-            <div class="bg-black/50 backdrop-blur-md rounded-2xl shadow-lg border border-white/10 overflow-hidden">
-                <div id="orders-list" class="divide-y divide-white/10"></div>
-            </div>
-             <div id="empty-state" class="hidden text-center py-20 px-6 bg-black/50 backdrop-blur-md rounded-2xl border border-white/10 mt-4">
-                <svg class="mx-auto h-12 w-12 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 6l12-3" /></svg>
-                <h3 class="mt-2 text-lg font-medium text-white">Очередь пуста</h3>
-                <p class="mt-1 text-sm text-gray-400">Новые заказы появятся здесь.</p>
-            </div>
-            <div id="history-section" class="hidden mt-8">
-                 <div class="flex flex-wrap justify-between items-center mb-4 gap-4">
-                    <h2 class="text-2xl font-bold">История за вечер</h2>
-                 </div>
-                <div class="bg-black/50 backdrop-blur-md rounded-2xl shadow-lg border border-white/10 overflow-hidden">
-                    <div id="history-list" class="divide-y divide-white/10"></div>
-                     <div id="empty-history-state" class="hidden text-center py-20 px-6">
-                        <i data-lucide="history" class="mx-auto h-12 w-12 text-gray-500"></i>
-                        <h3 class="mt-2 text-lg font-medium text-white">История пуста</h3>
-                        <p class="mt-1 text-sm text-gray-400">Завершённые заказы появятся здесь.</p>
-                    </div>
-                </div>
-                <div class="mt-6 p-4 border-t-2 border-red-500/30 rounded-lg bg-black/50">
-                    <h3 class="font-bold text-red-400">Опасная зона</h3>
-                    <p class="text-xs text-gray-400 mt-1 mb-3">Это действие полностью очистит все активные заказы и историю за вечер.</p>
-                     <button id="clear-all-btn" class="text-sm bg-red-800/50 text-red-300 hover:bg-red-700/50 px-3 py-2 rounded-lg transition flex items-center gap-2">
-                        <i data-lucide="power-off" class="w-4 h-4"></i>
-                        Начать новый вечер
-                    </button>
-                </div>
-            </div>
-        </div>
-        
-        <div id="edit-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-             <div class="bg-black/80 border border-white/20 p-8 rounded-2xl shadow-lg w-full max-w-md">
-                 <h2 class="text-2xl font-bold mb-6 text-white">Редактировать заказ</h2>
-                 <form id="edit-form">
-                     <input type="hidden" id="edit-order-id">
-                     <div class="mb-4"><label for="edit_song_title" class="block text-sm font-medium text-gray-300 mb-2">Название песни *</label><input type="text" id="edit_song_title" required class="w-full bg-gray-900/50 border border-white/20 text-white rounded-lg p-3 outline-none"></div>
-                     <div class="mb-4"><label for="edit_artist_name" class="block text-sm font-medium text-gray-300 mb-2">Исполнитель</label><input type="text" id="edit_artist_name" class="w-full bg-gray-900/50 border border-white/20 text-white rounded-lg p-3 outline-none"></div>
-                     <div class="mb-6"><label for="edit_order_note" class="block text-sm font-medium text-gray-300 mb-2">Примечание</label><textarea id="edit_order_note" rows="2" class="w-full bg-gray-900/50 border border-white/20 text-white rounded-lg p-3 outline-none"></textarea></div>
-                     <div class="flex justify-end gap-4"><button type="button" id="cancel-edit-btn" class="bg-gray-600/50 hover:bg-gray-500/50 px-6 py-2 rounded-lg transition">Отмена</button><button type="submit" class="bg-purple-600 hover:bg-purple-700 px-6 py-2 rounded-lg transition">Сохранить</button></div>
-                 </form>
-             </div>
-        </div>
-        
-        <!-- Модальное окно общей истории -->
-        <div id="general-history-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-             <div class="bg-black/80 border border-white/20 p-6 rounded-2xl shadow-lg w-full max-w-2xl flex flex-col h-[90vh]">
-                 <div class="flex justify-between items-center mb-4 flex-shrink-0">
-                    <h2 class="text-2xl font-bold text-white">Общая история песен</h2>
-                    <button id="close-general-history-btn" class="text-gray-400 hover:text-white"><i data-lucide="x" class="w-6 h-6"></i></button>
-                 </div>
-                 <div id="general-history-list" class="flex-grow overflow-y-auto pr-2 space-y-2"></div>
-             </div>
-        </div>
-
-    </div>
-
-    <script>
-    const API_BASE_URL = 'https://karaoke-moscow-server.onrender.com/api';
-
-    const api = {
-        async _request(method, path, body = null) {
-            const loadingOverlay = document.getElementById('loading-overlay');
-            const connectionErrorPanel = document.getElementById('connection-error-panel');
-            loadingOverlay.classList.remove('hidden');
-            try {
-                const options = { method, headers: { 'Content-Type': 'application/json' } };
-                if (body) options.body = JSON.stringify(body);
-                const response = await fetch(`${API_BASE_URL}${path}`, options);
-                connectionErrorPanel.classList.add('hidden');
-                if (!response.ok) { throw new Error( (await response.json()).message || 'Ошибка сервера' ); }
-                return response.status === 204 ? null : response.json();
-            } catch (err) {
-                console.error(`Ошибка API: ${method} ${path}`, err);
-                if (err instanceof TypeError && (err.message.includes('Failed to fetch') || err.message.includes('NetworkError'))) {
-                    document.getElementById('error-ip-address').textContent = API_BASE_URL;
-                    connectionErrorPanel.classList.remove('hidden');
-                }
-                throw err;
-            } finally {
-                loadingOverlay.classList.add('hidden');
-            }
-        },
-        getOrders: () => api._request('GET', '/orders'),
-        getNotifications: () => api._request('GET', '/notifications'),
-        getHistory: () => api._request('GET', '/history'),
-        createOrder: (data) => api._request('POST', '/orders', data),
-        editOrder: (id, data) => api._request('PATCH', `/orders/${id}`, data),
-        deleteOrder: (id, byGuest) => api._request('DELETE', `/orders/${id}?byGuest=${byGuest}`),
-        updateOrderStatus: (id, status) => api._request('PATCH', `/orders/${id}/status`, { status }),
-        reorderOrders: (orderedIds) => api._request('POST', '/orders/reorder', { orderedIds }),
-        clearNotifications: () => api._request('DELETE', '/notifications'),
-        clearTableHistory: (tableId) => api._request('DELETE', `/orders/table/${tableId}`),
-        clearAll: () => api._request('DELETE', '/orders/all'),
+// Функция для создания и отправки уведомления
+const createNotification = (type, payload) => {
+    const notification = {
+        id: Date.now(),
+        type, // 'cancelled' или 'edited'
+        payload,
+        timestamp: new Date().toISOString()
     };
+    notifications.unshift(notification); // Добавляем в начало массива
+    if (notifications.length > 50) { // Ограничиваем количество хранимых уведомлений
+        notifications.pop();
+    }
+    io.emit('new_notification', notification);
+    console.log(`Создано уведомление: ${type}`);
+};
 
-    document.addEventListener('DOMContentLoaded', () => {
-        const homeView = document.getElementById('home-view');
-        const guestView = document.getElementById('guest-view');
-        const djView = document.getElementById('dj-view');
-        const emptyState = document.getElementById('empty-state');
-        const ordersList = document.getElementById('orders-list');
-        const toggleHistoryBtn = document.getElementById('toggle-history-btn');
-        const historySection = document.getElementById('history-section');
-        const historyList = document.getElementById('history-list');
-        const emptyHistoryState = document.getElementById('empty-history-state');
-        const orderForm = document.getElementById('order-form');
-        const tableInfo = document.getElementById('table-info');
-        const guestMessage = document.getElementById('guest-message');
-        const vipToggle = document.getElementById('vip-order-toggle');
-        const guestHistoryList = document.getElementById('guest-history-list');
-        const emptyGuestHistoryState = document.getElementById('empty-guest-history-state');
-        const editModal = document.getElementById('edit-modal');
-        const editForm = document.getElementById('edit-form');
-        const cancelEditBtn = document.getElementById('cancel-edit-btn');
-        const notificationBtn = document.getElementById('notification-btn');
-        const notificationBadge = document.getElementById('notification-badge');
-        const notificationPanel = document.getElementById('notification-panel');
-        const notificationList = document.getElementById('notification-list');
-        const emptyNotificationState = document.getElementById('empty-notification-state');
-        const clearNotificationsBtn = document.getElementById('clear-notifications-btn');
-        const connectionStatusDot = document.getElementById('connection-status-dot');
-        const connectionStatusText = document.getElementById('connection-status-text');
-        const tablesGrid = document.getElementById('tables-grid');
-        const clearAllBtn = document.getElementById('clear-all-btn');
-        const toggleGeneralHistoryBtn = document.getElementById('toggle-general-history-btn');
-        const generalHistoryModal = document.getElementById('general-history-modal');
-        const closeGeneralHistoryBtn = document.getElementById('close-general-history-btn');
-        const generalHistoryList = document.getElementById('general-history-list');
-        let currentTableId = null;
-        let socket;
 
-        const formatTime = (dateString) => new Date(dateString).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        const formatDate = (dateString) => new Date(dateString).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
-        const escapeHTML = (str) => String(str).replace(/[&<>"']/g, match => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[match]));
-        
-        const createActiveOrderElement = (order) => {
-            const div = document.createElement('div'); div.id = `order-${order.id}`; div.draggable = true;
-            div.className = `order-item p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 transition-all duration-300 ${order.status === 'in_progress' ? 'bg-purple-500/20' : ''} ${order.type === 'vip' ? 'border-l-4 border-yellow-400' : ''}`;
-            div.innerHTML = `<div class="flex items-center gap-4 flex-1"><i data-lucide="grip-vertical" class="text-gray-500 cursor-grab touch-none"></i> ${order.type === 'vip' ? '<i data-lucide="crown" class="text-yellow-400"></i>' : '<div class="w-6"></div>'} <div class="text-center w-12 flex-shrink-0"><div class="text-sm text-gray-400">Стол</div><div class="text-2xl font-bold text-purple-400">${order.table_id}</div></div><div class="min-w-0"><p class="font-bold text-lg text-white truncate">${escapeHTML(order.song_title)}</p><p class="text-sm text-gray-400 truncate">${escapeHTML(order.artist_name)}</p>${order.note ? `<div class="mt-2 flex items-start gap-2 text-sm text-cyan-300 bg-cyan-500/10 p-2 rounded-md"><i data-lucide="message-square" class="w-4 h-4 flex-shrink-0 mt-0.5"></i><span class="break-words">${escapeHTML(order.note)}</span></div>` : ''}</div></div><div class="flex items-center justify-end md:justify-end gap-2 flex-shrink-0"><span class="text-sm text-gray-400">${formatTime(order.created_at)}</span><div class="flex items-center gap-2">${order.status === 'new' ? `<button data-action="progress" data-id="${order.id}" class="action-btn bg-green-500/30 backdrop-blur-sm border border-green-400/50 hover:bg-green-500/50 p-2 rounded-lg text-white transition-all transform hover:scale-110 shadow-lg" title="В работу"><i data-lucide="play-circle"></i></button>` : ''}<button data-action="complete" data-id="${order.id}" class="action-btn bg-blue-500/30 backdrop-blur-sm border border-blue-400/50 hover:bg-blue-500/50 p-2 rounded-lg text-white transition-all transform hover:scale-110 shadow-lg" title="Завершить"><i data-lucide="check-circle"></i></button><button data-action="delete" data-id="${order.id}" class="action-btn bg-red-500/30 backdrop-blur-sm border border-red-400/50 hover:bg-red-500/50 p-2 rounded-lg text-white transition-all transform hover:scale-110 shadow-lg" title="Удалить"><i data-lucide="x-circle"></i></button></div></div>`;
-            return div;
-        };
-        const createHistoryOrderElement = (order) => {
-             const div = document.createElement('div');
-             div.className = 'flex flex-col md:flex-row md:items-center justify-between gap-4 opacity-80 bg-white/5 p-3 rounded-lg';
-             div.innerHTML = `<div class="flex items-center gap-4 flex-1">${order.type === 'vip' ? '<i data-lucide="crown" class="text-yellow-600 w-4 h-4"></i>' : '<div class="w-4"></div>'}<div class="min-w-0"><p class="font-semibold text-gray-300 truncate">${escapeHTML(order.song_title)}</p><p class="text-sm text-gray-500 truncate">${escapeHTML(order.artist_name)}</p></div></div><div class="text-sm text-gray-500">${formatTime(order.created_at)}</div>`;
-             return div;
-        };
-        const createGuestHistoryElement = (order) => {
-            const div = document.createElement('div');
-            let statusText, statusColor, canEdit;
-            switch (order.status) {
-                case 'in_progress': statusText = 'В работе'; statusColor = 'text-green-400'; canEdit = false; break;
-                case 'completed': statusText = 'Исполнено'; statusColor = 'text-gray-500'; canEdit = false; break;
-                default: statusText = 'В очереди'; statusColor = 'text-purple-400'; canEdit = true;
-            }
-            div.className = `bg-black/20 p-3 rounded-lg flex justify-between items-center transition-all ${!canEdit ? 'opacity-60' : ''}`;
-            div.innerHTML = `<div class="flex items-center gap-2 min-w-0">${order.type === 'vip' ? '<i data-lucide="crown" class="w-4 h-4 text-yellow-400 flex-shrink-0"></i>' : ''}<div class="min-w-0"><p class="font-semibold text-white truncate">${escapeHTML(order.song_title)}</p><p class="text-xs text-gray-400 truncate">${escapeHTML(order.artist_name)}</p></div></div><div class="flex items-center gap-2"><div class="text-sm font-semibold ${statusColor} flex-shrink-0">${statusText}</div>${canEdit ? `<button data-action="edit" data-id="${order.id}" class="text-gray-400 hover:text-white p-1"><i data-lucide="pencil" class="w-4 h-4"></i></button><button data-action="cancel" data-id="${order.id}" class="text-gray-400 hover:text-red-400 p-1"><i data-lucide="x" class="w-4 h-4"></i></button>` : ''}</div>`;
-            return div;
-        };
-        const createNotificationElement = (notification) => {
-            const div = document.createElement('div'); const { type, payload, timestamp } = notification; let message, icon, iconColor;
-            if (type === 'cancelled') { message = `<strong>Стол №${payload.table_id}</strong> отменил заказ: "${escapeHTML(payload.song_title)}"`; icon = 'trash-2'; iconColor = 'text-red-400'; }
-            else if (type === 'edited') { message = `<strong>Стол №${payload.table_id}</strong> изменил заказ: "${escapeHTML(payload.song_title)}"`; icon = 'edit'; iconColor = 'text-cyan-300'; }
-            div.className = 'p-3 flex items-start gap-3 hover:bg-white/5 rounded-lg';
-            div.innerHTML = `<i data-lucide="${icon}" class="${iconColor} w-5 h-5 mt-1 flex-shrink-0"></i><div><p class="text-sm text-white">${message}</p><p class="text-xs text-gray-400">${formatTime(timestamp)}</p></div>`;
-            return div;
-        };
-        
-        async function renderDjPanel(highlightId = null) {
-            try {
-                const orders = await api.getOrders();
-                const active = orders.filter(o => o.status !== 'completed');
-                const completed = orders.filter(o => o.status === 'completed');
-                ordersList.innerHTML = '';
-                active.forEach(o => ordersList.appendChild(createActiveOrderElement(o)));
-                historyList.innerHTML = '';
-                const completedByTable = completed.reduce((acc, order) => {
-                    (acc[order.table_id] = acc[order.table_id] || []).push(order);
-                    return acc;
-                }, {});
-                const sortedTableIds = Object.keys(completedByTable).sort((a, b) => a - b);
-                sortedTableIds.forEach(tableId => {
-                    const tableGroupDiv = document.createElement('div');
-                    tableGroupDiv.className = 'py-2 px-2 md:py-4 md:px-4';
-                    const tableHeader = document.createElement('div');
-                    tableHeader.className = 'flex justify-between items-center mb-2';
-                    tableHeader.innerHTML = `<h4 class="font-bold text-lg text-purple-300">Стол №${tableId}</h4><button data-action="clear-table-history" data-table-id="${tableId}" class="clear-table-btn text-xs bg-red-500/30 text-red-300 hover:bg-red-500/50 px-2 py-1 rounded-md transition">Очистить стол</button>`;
-                    tableGroupDiv.appendChild(tableHeader);
-                    const ordersForTableDiv = document.createElement('div');
-                    ordersForTableDiv.className = 'space-y-2';
-                    completedByTable[tableId].forEach(order => ordersForTableDiv.appendChild(createHistoryOrderElement(order)));
-                    tableGroupDiv.appendChild(ordersForTableDiv);
-                    historyList.appendChild(tableGroupDiv);
-                });
-                emptyState.classList.toggle('hidden', active.length > 0);
-                emptyHistoryState.classList.toggle('hidden', completed.length > 0);
-                if (highlightId) { const el = document.getElementById(`order-${highlightId}`); if (el) { el.classList.add('highlight-update'); setTimeout(() => el.classList.remove('highlight-update'), 1500); } }
-                lucide.createIcons();
-            } catch (err) { /* handled by api */ }
-        }
+// API Маршруты
 
-        async function renderNotificationHistory() {
-             try {
-                const notifications = await api.getNotifications();
-                notificationList.innerHTML = '';
-                emptyNotificationState.classList.toggle('hidden', notifications.length > 0);
-                notifications.forEach(n => notificationList.appendChild(createNotificationElement(n)));
-                lucide.createIcons();
-            } catch (err) { /* handled by api */ }
-        }
-        
-        async function renderGuestHistory(tableId) {
-            if (!tableId) return;
-            try {
-                const myOrders = (await api.getOrders()).filter(o => o.table_id == tableId);
-                guestHistoryList.innerHTML = '';
-                emptyGuestHistoryState.classList.toggle('hidden', myOrders.length > 0);
-                myOrders.forEach(order => guestHistoryList.appendChild(createGuestHistoryElement(order)));
-                lucide.createIcons();
-            } catch(err) { /* handled by api */ }
-        }
+// 1. Проверка состояния
+app.get('/api/health', async (req, res) => {
+    try {
+        await db.query('SELECT NOW()');
+        res.status(200).json({ dbConnected: true });
+    } catch (error) {
+        console.error("Ошибка проверки состояния БД:", error);
+        res.status(503).json({ dbConnected: false });
+    }
+});
 
-        historyList.addEventListener('click', async (e) => {
-            const button = e.target.closest('.clear-table-btn');
-            if (!button) return;
-            const tableId = button.dataset.tableId;
-            if (confirm(`Вы уверены, что хотите удалить ВСЕ заказы (включая активные) для стола №${tableId}?`)) {
-                await api.clearTableHistory(tableId);
-            }
-        });
-        
-        clearAllBtn.addEventListener('click', async () => {
-            if (confirm('Вы уверены, что хотите УДАЛИТЬ ВСЕ ЗАКАЗЫ И ИСТОРИЮ ЗА ВЕЧЕР?')) {
-                await api.clearAll();
-            }
-        });
+// 2. Получить все заказы
+app.get('/api/orders', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM orders ORDER BY order_index ASC, created_at ASC');
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка сервера');
+  }
+});
 
-        guestHistoryList.addEventListener('click', async (e) => {
-            const button = e.target.closest('button');
-            if (!button) return;
-            const action = button.dataset.action;
-            const id = parseInt(button.dataset.id);
-            if (action === 'cancel') {
-                if (confirm('Вы уверены, что хотите отменить этот заказ?')) await api.deleteOrder(id, true);
-            } else if (action === 'edit') {
-                const orderToEdit = (await api.getOrders()).find(o => o.id === id);
-                if (orderToEdit) {
-                    document.getElementById('edit-order-id').value = orderToEdit.id;
-                    document.getElementById('edit_song_title').value = orderToEdit.song_title;
-                    document.getElementById('edit_artist_name').value = orderToEdit.artist_name;
-                    document.getElementById('edit_order_note').value = orderToEdit.note;
-                    editModal.classList.remove('hidden');
-                }
-            }
-        });
+// 3. Создать новый заказ
+app.post('/api/orders', async (req, res) => {
+    const { song_title, artist_name, table_id, isVip, note } = req.body;
+    if (!song_title || !table_id) {
+        return res.status(400).send('Название песни и номер стола обязательны');
+    }
+    try {
+        const type = isVip ? 'vip' : 'regular';
+        // VIP заказы получают высокий order_index, чтобы быть вверху
+        const order_index = isVip ? 999999 : 1000; 
 
-        editForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const id = parseInt(document.getElementById('edit-order-id').value);
-            const newData = { song_title: document.getElementById('edit_song_title').value, artist_name: document.getElementById('edit_artist_name').value, note: document.getElementById('edit_order_note').value };
-            await api.editOrder(id, newData);
-            editModal.classList.add('hidden');
-        });
-        cancelEditBtn.addEventListener('click', () => editModal.classList.add('hidden'));
+        const { rows } = await db.query(
+            'INSERT INTO orders (song_title, artist_name, table_id, type, status, note, order_index) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [song_title, artist_name, table_id, type, 'new', note, order_index]
+        );
+        broadcastUpdate();
+        res.status(201).json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
 
-        orderForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const songTitle = e.target.elements.song_title.value;
-            const artistName = e.target.elements.artist_name.value;
-            const orderNote = e.target.elements.order_note.value;
-            const isVip = vipToggle.checked;
-            if (!songTitle.trim()) { showMessage('Пожалуйста, введите название песни.', 'error'); return; }
-            try {
-                await api.createOrder({ song_title: songTitle, artist_name: artistName, table_id: currentTableId, isVip, note: orderNote });
-                showMessage('Заказ принят!', 'success');
-                orderForm.reset();
-            } catch (error) { showMessage(error.message || 'Не удалось отправить заказ.', 'error'); }
-        });
-        
-        ordersList.addEventListener('click', async (e) => { const button = e.target.closest('.action-btn'); if (!button) return; const action = button.dataset.action; const id = parseInt(button.dataset.id, 10); if (action === 'progress') await api.updateOrderStatus(id, 'in_progress'); else if (action === 'complete') await api.updateOrderStatus(id, 'completed'); else if (action === 'delete') await api.deleteOrder(id, false); });
-        toggleHistoryBtn.addEventListener('click', () => { const isHidden = historySection.classList.toggle('hidden'); toggleHistoryBtn.textContent = isHidden ? 'История за вечер' : 'Скрыть историю'; });
-        
-        toggleGeneralHistoryBtn.addEventListener('click', async () => {
-            try {
-                const history = await api.getHistory();
-                generalHistoryList.innerHTML = '';
-                if(history.length > 0) {
-                    history.forEach(order => generalHistoryList.appendChild(createGeneralHistoryElement(order)));
-                } else {
-                    generalHistoryList.innerHTML = '<p class="text-gray-400 text-center p-8">Общая история пуста.</p>';
-                }
-                generalHistoryModal.classList.remove('hidden');
-                lucide.createIcons();
-            } catch (err) {
-                alert('Не удалось загрузить общую историю.');
-            }
-        });
-        closeGeneralHistoryBtn.addEventListener('click', () => generalHistoryModal.classList.add('hidden'));
+// 4. Обновить статус заказа
+app.patch('/api/orders/:id/status', async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body; // 'in_progress' или 'completed'
+    try {
+        const { rows } = await db.query(
+            'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
+            [status, id]
+        );
+        broadcastUpdate();
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
 
-        let draggingElement = null;
-        ordersList.addEventListener('dragstart', (e) => { if (e.target.classList.contains('order-item')) { draggingElement = e.target; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', draggingElement.id); setTimeout(() => draggingElement.classList.add('dragging'), 0); } });
-        ordersList.addEventListener('dragend', () => { if(draggingElement) { draggingElement.classList.remove('dragging'); draggingElement = null; } });
-        ordersList.addEventListener('dragover', (e) => { e.preventDefault(); const afterElement = getDragAfterElement(ordersList, e.clientY); if (draggingElement) { if (afterElement == null) { ordersList.appendChild(draggingElement); } else { ordersList.insertBefore(draggingElement, afterElement); } } });
-        ordersList.addEventListener('drop', async (e) => { e.preventDefault(); if (draggingElement) { const orderedIds = Array.from(ordersList.children).map(child => child.id.split('-')[1]); await api.reorderOrders(orderedIds); } });
-        const getDragAfterElement = (container, y) => { const draggableElements = [...container.querySelectorAll('.order-item:not(.dragging)')]; return draggableElements.reduce((closest, child) => { const box = child.getBoundingClientRect(); const offset = y - box.top - box.height / 2; if (offset < 0 && offset > closest.offset) { return { offset: offset, element: child }; } else { return closest; } }, { offset: Number.NEGATIVE_INFINITY }).element; };
-        
-        notificationBtn.addEventListener('click', () => {
-            notificationPanel.classList.toggle('hidden');
-            notificationBadge.classList.add('hidden');
-        });
-        clearNotificationsBtn.addEventListener('click', async () => {
-            await api.clearNotifications();
-            await renderNotificationHistory();
-        });
+// 5. Редактировать заказ (гостем или диджеем)
+app.patch('/api/orders/:id', async (req, res) => {
+    const { id } = req.params;
+    const { song_title, artist_name, note } = req.body;
+    try {
+        const { rows } = await db.query(
+            'UPDATE orders SET song_title = $1, artist_name = $2, note = $3 WHERE id = $4 RETURNING *',
+            [song_title, artist_name, note, id]
+        );
+        // Если заказ был изменен, создаем уведомление
+        createNotification('edited', rows[0]);
+        broadcastUpdate();
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
 
-        function showMessage(text, type) {
-            guestMessage.textContent = text;
-            guestMessage.className = `my-4 text-center p-3 rounded-lg ${type === 'success' ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`;
-            setTimeout(() => { guestMessage.textContent = ''; guestMessage.className = 'my-4 text-center'; }, 5000);
-        }
+// 6. Добавить/изменить заметку диджея
+app.patch('/api/orders/:id/dj-note', async (req, res) => {
+    const { id } = req.params;
+    const { dj_note } = req.body;
+    try {
+        const { rows } = await db.query(
+            'UPDATE orders SET dj_note = $1 WHERE id = $2 RETURNING *',
+            [dj_note, id]
+        );
+        broadcastUpdate();
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
 
-        function connectSocket() {
-            const url = API_BASE_URL.replace('/api', '');
-            socket = io(url);
-            socket.on('connect', () => { console.log('Socket.IO подключен!'); if(djView.classList.contains('hidden')) return; connectionStatusText.textContent = 'Online'; connectionStatusDot.querySelector('span:first-child').classList.add('animate-ping'); connectionStatusDot.querySelector('span:last-child').classList.remove('bg-red-500'); connectionStatusDot.querySelector('span:last-child').classList.add('bg-green-500'); });
-            socket.on('disconnect', () => { console.log('Socket.IO отключен!'); if(djView.classList.contains('hidden')) return; connectionStatusText.textContent = 'Offline'; connectionStatusDot.querySelector('span:first-child').classList.remove('animate-ping'); connectionStatusDot.querySelector('span:last-child').classList.remove('bg-green-500'); connectionStatusDot.querySelector('span:last-child').classList.add('bg-red-500'); });
-            socket.on('update_orders', () => { console.log('Получено обновление заказов по сокету'); if (!djView.classList.contains('hidden')) renderDjPanel(); if (!guestView.classList.contains('hidden')) renderGuestHistory(currentTableId); });
-            socket.on('new_notification', (notification) => { console.log('Получено новое уведомление'); if (!djView.classList.contains('hidden')) { renderNotificationHistory(); if (notificationPanel.classList.contains('hidden')) { notificationBadge.classList.remove('hidden'); } } });
+
+// 7. Удалить заказ
+app.delete('/api/orders/:id', async (req, res) => {
+    const { id } = req.params;
+    const byGuest = req.query.byGuest === 'true';
+    try {
+        // Сначала получаем данные заказа для уведомления
+        const orderResult = await db.query('SELECT * FROM orders WHERE id = $1', [id]);
+        if (orderResult.rows.length === 0) {
+            return res.status(404).send('Заказ не найден');
         }
         
-        function handleRouteChange() {
-            const hash = window.location.hash;
-            const allViews = [homeView, guestView, djView];
-            allViews.forEach(view => view.classList.add('hidden'));
-            if (socket) { socket.disconnect(); }
-            if (hash.startsWith('#/table/') || hash === '#/dj-panel') {
-                connectSocket(); 
-            }
-            if (hash.startsWith('#/table/')) {
-                const tableId = hash.split('/')[2];
-                if (tableId) {
-                    currentTableId = tableId;
-                    tableInfo.textContent = `Вы за столиком №${tableId}`;
-                    renderGuestHistory(currentTableId);
-                    guestView.classList.remove('hidden');
-                } else { homeView.classList.remove('hidden'); }
-            } else if (hash === '#/dj-panel') {
-                renderDjPanel();
-                renderNotificationHistory();
-                djView.classList.remove('hidden');
-            } else {
-                homeView.classList.remove('hidden');
-            }
+        if (byGuest) {
+             createNotification('cancelled', orderResult.rows[0]);
         }
         
-        function generateTableButtons() {
-            tablesGrid.innerHTML = '';
-            for (let i = 30; i <= 51; i++) {
-                const link = document.createElement('a');
-                link.href = `#/table/${i}`;
-                link.className = 'w-full bg-white/10 backdrop-blur-sm border border-white/20 hover:bg-white/20 text-white font-bold py-3 px-2 rounded-lg transition-all transform hover:scale-105 shadow-2xl text-center';
-                link.innerHTML = `<span class="text-xs opacity-70">Стол</span><br><span class="text-xl">${i}</span>`;
-                tablesGrid.appendChild(link);
-            }
-            const djLink = document.createElement('a');
-            djLink.href = "#/dj-panel";
-            djLink.className = "col-span-3 sm:col-span-4 md:col-span-5 lg:col-span-7 bg-purple-600/50 backdrop-blur-sm border border-purple-400/50 hover:bg-purple-500/50 text-white font-bold py-3 px-4 rounded-lg transition-all transform hover:scale-105 shadow-2xl";
-            djLink.textContent = "DJ-пульт";
-            tablesGrid.appendChild(djLink);
-        }
+        await db.query('DELETE FROM orders WHERE id = $1', [id]);
+        broadcastUpdate();
+        res.status(204).send();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
 
-        generateTableButtons();
-        window.addEventListener('hashchange', handleRouteChange);
-        handleRouteChange();
-        lucide.createIcons();
-    });
-    </script>
-</body>
-</html>
+// 8. Обновить порядок очереди
+app.post('/api/orders/reorder', async (req, res) => {
+    const { orderedIds } = req.body;
+    try {
+        const promises = orderedIds.map((id, index) => {
+            // Устанавливаем order_index в соответствии с новым порядком
+            return db.query('UPDATE orders SET order_index = $1 WHERE id = $2', [index, id]);
+        });
+        await Promise.all(promises);
+        broadcastUpdate();
+        res.status(200).send('Порядок обновлен');
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
 
+// 9. Очистить все заказы для стола
+app.delete('/api/orders/table/:tableId', async (req, res) => {
+    const { tableId } = req.params;
+    try {
+        await db.query('DELETE FROM orders WHERE table_id = $1', [tableId]);
+        broadcastUpdate();
+        res.status(204).send();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 10. Очистить все (начать новый вечер)
+app.delete('/api/orders/all', async (req, res) => {
+    try {
+        // Перемещаем исполненные заказы в общую историю перед удалением
+        await db.query(`
+            INSERT INTO general_history (song_title, artist_name, table_id, created_at)
+            SELECT song_title, artist_name, table_id, created_at FROM orders WHERE status = 'completed'
+        `);
+        // Удаляем все заказы
+        await db.query('DELETE FROM orders');
+        notifications = []; // Очищаем уведомления
+        broadcastUpdate();
+        res.status(204).send();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 11. Получить общую историю
+app.get('/api/history', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM general_history ORDER BY created_at DESC');
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка сервера');
+  }
+});
+
+// 12. Уведомления
+app.get('/api/notifications', (req, res) => {
+    res.json(notifications);
+});
+app.delete('/api/notifications', (req, res) => {
+    notifications = [];
+    io.emit('new_notification'); // Сообщаем клиентам, что уведомления очищены
+    res.status(204).send();
+});
+
+
+// Socket.IO
+io.on('connection', (socket) => {
+  console.log('Клиент подключился:', socket.id);
+  socket.on('disconnect', () => {
+    console.log('Клиент отключился:', socket.id);
+  });
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`Сервер запущен на порту ${PORT}`);
+});
