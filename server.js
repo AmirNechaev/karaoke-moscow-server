@@ -3,7 +3,7 @@ const http = require('http');
 const { Server } = require("socket.io");
 const mongoose = require('mongoose');
 const cors = require('cors');
-require('dotenv').config(); // Для локальной разработки
+require('dotenv').config(); 
 
 const app = express();
 const server = http.createServer(app);
@@ -43,6 +43,19 @@ let orders = [];
 let notifications = [];
 
 // --- API ЭНДПОИНТЫ ---
+
+// НОВЫЙ ЭНДПОИНТ для проверки статуса
+app.get('/api/health', (req, res) => {
+    const dbState = mongoose.connection.readyState;
+    // 0 = disconnected; 1 = connected; 2 = connecting; 3 = disconnecting
+    const isDbConnected = dbState === 1;
+    res.json({
+        status: 'ok',
+        dbConnected: isDbConnected,
+        dbState: dbState
+    });
+});
+
 
 app.get('/api/orders', (req, res) => {
   res.json(orders);
