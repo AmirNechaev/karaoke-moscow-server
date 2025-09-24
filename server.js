@@ -1,16 +1,15 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const mongoose = require('mongoose');
 const cors = require('cors');
-require('dotenv').config(); 
+const db = require('./db');
 
 const app = express();
 const server = http.createServer(app);
-
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: "*", // В целях безопасности здесь лучше указать домен вашего клиента
     methods: ["GET", "POST", "PATCH", "DELETE"]
   }
 });
@@ -18,179 +17,237 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ MONGODB ---
-mongoose.connect(process.env.DATABASE_URL)
-  .then(() => console.log('Успешное подключение к MongoDB Atlas'))
-  .catch(err => console.error('Ошибка подключения к MongoDB:', err));
-
-// --- МОДЕЛЬ ДАННЫХ ДЛЯ ИСТОРИИ ---
-const historySchema = new mongoose.Schema({
-    id: Number,
-    song_title: String,
-    artist_name: String,
-    table_id: String,
-    status: String,
-    type: String,
-    note: String,
-    dj_note: String,
-    created_at: Date
-});
-
-const History = mongoose.model('History', historySchema);
-
-// --- ХРАНИЛИЩЕ ДАННЫХ В ПАМЯТИ (для текущей сессии) ---
-let orders = [];
+// Простое хранилище уведомлений в памяти. Для продакшена можно заменить на Redis или таблицу в БД.
 let notifications = [];
 
-// --- API ЭНДПОИНТЫ ---
+// Функция для отправки обновлений всем клиентам
+const broadcastUpdate = () => {
+  io.emit('update_orders');
+  console.log('Разослано событие: update_orders');
+};
 
-// НОВЫЙ ЭНДПОИНТ для проверки статуса
-app.get('/api/health', (req, res) => {
-    const dbState = mongoose.connection.readyState;
-    // 0 = disconnected; 1 = connected; 2 = connecting; 3 = disconnecting
-    const isDbConnected = dbState === 1;
-    res.json({
-        status: 'ok',
-        dbConnected: isDbConnected,
-        dbState: dbState
-    });
+// Функция для создания и отправки уведомления
+const createNotification = (type, payload) => {
+    const notification = {
+        id: Date.now(),
+        type, // 'cancelled' или 'edited'
+        payload,
+        timestamp: new Date().toISOString()
+    };
+    notifications.unshift(notification); // Добавляем в начало массива
+    if (notifications.length > 50) { // Ограничиваем количество хранимых уведомлений
+        notifications.pop();
+    }
+    io.emit('new_notification', notification);
+    console.log(`Создано уведомление: ${type}`);
+};
+
+
+// API Маршруты
+
+// 1. Проверка состояния
+app.get('/api/health', async (req, res) => {
+    try {
+        await db.query('SELECT NOW()');
+        res.status(200).json({ dbConnected: true });
+    } catch (error) {
+        console.error("Ошибка проверки состояния БД:", error);
+        res.status(503).json({ dbConnected: false });
+    }
 });
 
-
-app.get('/api/orders', (req, res) => {
-  res.json(orders);
+// 2. Получить все заказы
+app.get('/api/orders', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM orders ORDER BY order_index ASC, created_at ASC');
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка сервера');
+  }
 });
 
-app.post('/api/orders', (req, res) => {
+// 3. Создать новый заказ
+app.post('/api/orders', async (req, res) => {
     const { song_title, artist_name, table_id, isVip, note } = req.body;
     if (!song_title || !table_id) {
-        return res.status(400).json({ message: 'Необходимо указать название песни и номер стола.' });
+        return res.status(400).send('Название песни и номер стола обязательны');
     }
-    const newOrder = {
-        id: Date.now(), song_title, artist_name: artist_name || 'Не указан', table_id,
-        status: 'new', type: isVip ? 'vip' : 'regular', note: note || '',
-        dj_note: '', created_at: new Date().toISOString()
-    };
-    const activeOrders = orders.filter(o => o.status !== 'completed');
-    const completedOrders = orders.filter(o => o.status === 'completed');
-    if (newOrder.type === 'vip') {
-        const lastInProgressIndex = activeOrders.findLastIndex(o => o.status === 'in_progress');
-        activeOrders.splice(lastInProgressIndex + 1, 0, newOrder);
-    } else { activeOrders.push(newOrder); }
-    orders = [...activeOrders, ...completedOrders];
-    io.emit('update_orders');
-    res.status(201).json(newOrder);
-});
-
-app.patch('/api/orders/:id', (req, res) => {
-    const orderId = parseInt(req.params.id);
-    const orderIndex = orders.findIndex(o => o.id === orderId);
-    if (orderIndex === -1) { return res.status(404).json({ message: 'Заказ не найден.' }); }
-    
-    const { song_title, artist_name, note } = req.body;
-    orders[orderIndex] = { ...orders[orderIndex], song_title, artist_name, note };
-    
-    const notification = { id: Date.now(), type: 'edited', payload: orders[orderIndex], timestamp: new Date().toISOString() };
-    notifications.unshift(notification);
-    
-    io.emit('update_orders');
-    io.emit('new_notification', notification);
-    res.json(orders[orderIndex]);
-});
-
-app.patch('/api/orders/:id/dj-note', (req, res) => {
-    const orderId = parseInt(req.params.id);
-    const orderIndex = orders.findIndex(o => o.id === orderId);
-    if (orderIndex === -1) { return res.status(404).json({ message: 'Заказ не найден.' }); }
-    orders[orderIndex].dj_note = req.body.dj_note || '';
-    io.emit('update_orders');
-    res.json(orders[orderIndex]);
-});
-
-app.patch('/api/orders/:id/status', async (req, res) => {
-    const orderId = parseInt(req.params.id);
-    const orderIndex = orders.findIndex(o => o.id === orderId);
-    if (orderIndex === -1) { return res.status(404).json({ message: 'Заказ не найден.' }); }
-
-    if (req.body.status === 'completed' && orders[orderIndex].status !== 'completed') {
-        const completedOrder = { ...orders[orderIndex], status: 'completed' };
-        try {
-            const historyEntry = new History(completedOrder);
-            await historyEntry.save();
-            console.log('Заказ сохранен в общую историю');
-        } catch (err) {
-            console.error('Ошибка сохранения в общую историю:', err);
-        }
-    }
-    
-    orders[orderIndex].status = req.body.status;
-    io.emit('update_orders');
-    res.json(orders[orderIndex]);
-});
-
-app.delete('/api/orders/:id', (req, res) => {
-    const orderId = parseInt(req.params.id);
-    const byGuest = req.query.byGuest === 'true';
-    const orderToDelete = orders.find(o => o.id === orderId);
-    if (orderToDelete && byGuest) {
-        const notification = { id: Date.now(), type: 'cancelled', payload: orderToDelete, timestamp: new Date().toISOString() };
-        notifications.unshift(notification);
-        io.emit('new_notification', notification);
-    }
-    orders = orders.filter(o => o.id !== orderId);
-    io.emit('update_orders');
-    res.status(204).send();
-});
-
-app.delete('/api/orders/table/:tableId', (req, res) => {
-    const tableIdToClear = req.params.tableId;
-    const initialOrderCount = orders.length;
-    orders = orders.filter(order => order.table_id != tableIdToClear);
-    if (orders.length < initialOrderCount) { io.emit('update_orders'); }
-    res.status(204).send();
-});
-
-app.delete('/api/orders/all', (req, res) => {
-    orders = [];
-    notifications = [];
-    io.emit('update_orders');
-    io.emit('update_notifications');
-    res.status(204).send();
-});
-
-app.post('/api/orders/reorder', (req, res) => {
-    const { orderedIds } = req.body;
-    const activeOrders = orders.filter(o => o.status !== 'completed');
-    const reordered = orderedIds.map(id => activeOrders.find(o => o.id === parseInt(id))).filter(Boolean);
-    const completed = orders.filter(o => o.status === 'completed');
-    if (reordered.length === activeOrders.length) {
-        orders = [...reordered, ...completed];
-        io.emit('update_orders');
-        res.json({ message: 'Очередь обновлена.' });
-    } else {
-        res.status(400).json({ message: 'Ошибка при пересортировке.' });
-    }
-});
-
-app.get('/api/notifications', (req, res) => { res.json(notifications); });
-app.delete('/api/notifications', (req, res) => { notifications = []; io.emit('update_notifications'); res.status(204).send(); });
-
-app.get('/api/history', async (req, res) => {
     try {
-        const history = await History.find().sort({ created_at: -1 });
-        res.json(history);
+        const type = isVip ? 'vip' : 'regular';
+        // VIP заказы получают высокий order_index, чтобы быть вверху
+        const order_index = isVip ? 999999 : 1000; 
+
+        const { rows } = await db.query(
+            'INSERT INTO orders (song_title, artist_name, table_id, type, status, note, order_index) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [song_title, artist_name, table_id, type, 'new', note, order_index]
+        );
+        broadcastUpdate();
+        res.status(201).json(rows[0]);
     } catch (err) {
-        res.status(500).json({ message: 'Не удалось загрузить общую историю' });
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
     }
 });
 
+// 4. Обновить статус заказа
+app.patch('/api/orders/:id/status', async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body; // 'in_progress' или 'completed'
+    try {
+        const { rows } = await db.query(
+            'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
+            [status, id]
+        );
+        broadcastUpdate();
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 5. Редактировать заказ (гостем или диджеем)
+app.patch('/api/orders/:id', async (req, res) => {
+    const { id } = req.params;
+    const { song_title, artist_name, note } = req.body;
+    try {
+        const { rows } = await db.query(
+            'UPDATE orders SET song_title = $1, artist_name = $2, note = $3 WHERE id = $4 RETURNING *',
+            [song_title, artist_name, note, id]
+        );
+        // Если заказ был изменен, создаем уведомление
+        createNotification('edited', rows[0]);
+        broadcastUpdate();
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 6. Добавить/изменить заметку диджея
+app.patch('/api/orders/:id/dj-note', async (req, res) => {
+    const { id } = req.params;
+    const { dj_note } = req.body;
+    try {
+        const { rows } = await db.query(
+            'UPDATE orders SET dj_note = $1 WHERE id = $2 RETURNING *',
+            [dj_note, id]
+        );
+        broadcastUpdate();
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+
+// 7. Удалить заказ
+app.delete('/api/orders/:id', async (req, res) => {
+    const { id } = req.params;
+    const byGuest = req.query.byGuest === 'true';
+    try {
+        // Сначала получаем данные заказа для уведомления
+        const orderResult = await db.query('SELECT * FROM orders WHERE id = $1', [id]);
+        if (orderResult.rows.length === 0) {
+            return res.status(404).send('Заказ не найден');
+        }
+        
+        if (byGuest) {
+             createNotification('cancelled', orderResult.rows[0]);
+        }
+        
+        await db.query('DELETE FROM orders WHERE id = $1', [id]);
+        broadcastUpdate();
+        res.status(204).send();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 8. Обновить порядок очереди
+app.post('/api/orders/reorder', async (req, res) => {
+    const { orderedIds } = req.body;
+    try {
+        const promises = orderedIds.map((id, index) => {
+            // Устанавливаем order_index в соответствии с новым порядком
+            return db.query('UPDATE orders SET order_index = $1 WHERE id = $2', [index, id]);
+        });
+        await Promise.all(promises);
+        broadcastUpdate();
+        res.status(200).send('Порядок обновлен');
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 9. Очистить все заказы для стола
+app.delete('/api/orders/table/:tableId', async (req, res) => {
+    const { tableId } = req.params;
+    try {
+        await db.query('DELETE FROM orders WHERE table_id = $1', [tableId]);
+        broadcastUpdate();
+        res.status(204).send();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 10. Очистить все (начать новый вечер)
+app.delete('/api/orders/all', async (req, res) => {
+    try {
+        // Перемещаем исполненные заказы в общую историю перед удалением
+        await db.query(`
+            INSERT INTO general_history (song_title, artist_name, table_id, created_at)
+            SELECT song_title, artist_name, table_id, created_at FROM orders WHERE status = 'completed'
+        `);
+        // Удаляем все заказы
+        await db.query('DELETE FROM orders');
+        notifications = []; // Очищаем уведомления
+        broadcastUpdate();
+        res.status(204).send();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Ошибка сервера');
+    }
+});
+
+// 11. Получить общую историю
+app.get('/api/history', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM general_history ORDER BY created_at DESC');
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка сервера');
+  }
+});
+
+// 12. Уведомления
+app.get('/api/notifications', (req, res) => {
+    res.json(notifications);
+});
+app.delete('/api/notifications', (req, res) => {
+    notifications = [];
+    io.emit('new_notification'); // Сообщаем клиентам, что уведомления очищены
+    res.status(204).send();
+});
+
+
+// Socket.IO
 io.on('connection', (socket) => {
-  console.log('Клиент подключен:', socket.id);
-  socket.on('disconnect', () => { console.log('Клиент отключен:', socket.id); });
+  console.log('Клиент подключился:', socket.id);
+  socket.on('disconnect', () => {
+    console.log('Клиент отключился:', socket.id);
+  });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`Сервер КАРАОКЕ МОСКВА запущен и слушает порт ${PORT}`);
+  console.log(`Сервер запущен на порту ${PORT}`);
 });
-
